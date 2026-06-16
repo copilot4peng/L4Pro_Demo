@@ -1,0 +1,190 @@
+我想做一个探照灯管理器，首先要做到的就是初始化初始化的过程中，
+
+只能使用串口加波特率去连接探照灯，
+如果探照灯不存在的话，就修改管理器的状态为无设备。
+如果可以不停的读到串口发来的数据，那就代表有设备，并解析设备串口发来的数据填到对应的含义字段中，
+同时需要实现伺服控制，
+
+探照灯管理器（Searchlight Manager）
+
+实现一个高性能探照灯控制服务，
+核心逻辑：基于串口（UART）与硬件通信；采用生产者-消费者模式处理指令队列；状态机维护设备存在性及 LED 状态。
+
+核心功能：伺服回中/绝对角度控制、LED 开关/闪烁/亮度调节。
+
+串口波特率固定为 115200bps。
+
+做一个功能映射：
+{
+    "model": {
+        "name": "My Light",
+        "description": "A custom light source for your projects."
+    },
+    "init": {
+        "driver": "serial",
+        "baud_rate": 115200
+        
+    },
+    "control": {
+        "home": "55 AA DC 11 30 04 00 00 00 00 00 00 00 00 00 00 00 00 00 25",
+        "30, 20": "55 AA DC 11 30 0B 15 54 F1 C8 00 00 00 00 00 00 00 00 00 52"
+    },
+    "LED_control": {
+        "off": "55 AA DC 06 2C 74 02 00 5C",
+        "on": "55 AA DC 06 2C 74 01 00 5F",
+        "setting_light": {
+            "2": "55 AA DC 06 2C 74 0A 02 56",
+            "10": "55 AA DC 06 2C 74 0A 0A 5E",
+            "100": "55 AA DC 06 2C 74 0A 64 30"
+        }
+    },
+    "flash_settings": {
+        "enable": "55 AA DC 06 2C 74 09 00 57",
+        // "disable": "55 AA DC 06 2C 74 00 00 5B",
+        "settingHZ": {
+            "2hz": "55 AA DC 06 2C 74 0B 02 57",
+            "5hz": "55 AA DC 06 2C 74 0B 05 50",
+            "10hz": "55 AA DC 06 2C 74 0B 0A 5F",
+            "15hz": "55 AA DC 06 2C 74 0B 0F 5A"
+        },
+        "off": "55 aa dc 06 2c 74 02 00 5c",
+        "on": "55 aa dc 06 2c 74 01 00 5f"
+    }
+}
+
+单例模式，确保全局只有一个探照灯管理器实例，提供统一的接口进行设备控制和状态查询。
+namespace SearchlightControl {
+
+class LightTask {
+    std::string command;
+    std::vector<uint8_t> parameters;
+}
+
+class Searchlight {
+    void initialize(json config);
+    bool online();
+    bool setting_light_level(int level);
+    bool setting_flash(int hz);
+    bool open_flash();
+    bool close_flash();
+    bool home();
+    bool move_to(int x, int y);
+    bool open_led();
+    bool close_led();
+    void get_status(string& status);
+
+    std::vector<LightTask> serial_buffer;
+    thread read_serial;
+    thread worker_thread;
+};
+
+class SearchlightManager {
+
+private:
+    Searchlight searchlight;
+    SearchlightManager() {}
+    SearchlightManager(const SearchlightManager&) = delete;
+    SearchlightManager& operator=(const SearchlightManager&) = delete;
+public:
+    static SearchlightManager& getInstance();
+};
+
+}
+
+根据您提供的协议片段，以下是针对“帧结构（Big-Endian）”的详细整理与架构实现逻辑解析。
+
+### 1. 帧结构定义表
+
+该协议采用标准的大端（Big-Endian）序列，最小帧长为 4 字节，最大为 63 字节。
+
+| Byte 索引 | 名称 | 固定值/定义 | 说明 |
+| --- | --- | --- | --- |
+| 0 | Header | `0x55` | 帧头起始 |
+| 1 | Header | `0xAA` | 帧头标识 |
+| 2 | CMD_ID | `0xDC` | 命令/控制标识（在此场景下固定） |
+| 3 | Body Length | `n` | **关键位域解析** (见下文) |
+| 4 ~ n+1 | Data | 可变 | 具体指令参数（如角度、开关状态） |
+| n+2 | CHECKSUM | `CS` | 异或校验和 |
+
+---
+
+### 2. 核心字段深度解析
+
+#### 2.1 长度字段 (Byte 3) 的位域映射
+
+该字节不仅记录长度，还包含了帧计数器，在编码实现时必须使用 **位运算 (Bitwise Operation)** 拆解：
+
+* **bit 0 ~ 5 (低 6 位)**：表示 `Body Length (n)`。
+* `n` 的定义：从 `Byte 3` 到 `Checksum` 位的所有字节总和（不含校验位本身）。
+* 最小 `n=4`，最大 `n=63`。
+
+
+* **bit 6 ~ 7 (高 2 位)**：表示 `Frame Counter`（帧计数器）。
+* 该值应在每次发送新帧时递增（范围 0-3），用于接收方判断丢包或重复。
+
+
+
+#### 2.2 校验和 (CHECKSUM) 计算规则
+
+该协议要求对帧内的数据进行异或运算，这对于保障串口通信（UART）的完整性至关重要。
+
+* **计算范围**：从 `Byte 3` (包含长度位) 到 `Byte n+1` (数据包最后一个字节)。
+* **逻辑算法**：
+```python
+# 伪代码逻辑
+checksum = 0
+for i in range(3, n + 2): # 从字节3开始到数据末尾
+    checksum ^= buffer[i]
+
+```
+
+
+
+---
+
+### 3. 工程实现建议（Codex 友好）
+
+在开发探照灯管理器时，建议封装一个 `ProtocolPacker` 类来处理这些逻辑，以防止手动拼包出错。
+
+#### 伪代码实现示例
+
+```python
+def create_frame(cmd_id, data, frame_counter=0):
+    # 1. 组装基础部分
+    body = [cmd_id] + data
+    n = len(body) # 计算长度
+    
+    # 2. 构造 Byte 3: 长度 + 计数器
+    # (n & 0x3F) 确保长度不超过6位，(counter << 6) 将计数器移至高位
+    len_byte = (n & 0x3F) | ((frame_counter & 0x03) << 6)
+    
+    # 3. 构造完整帧并计算 Checksum
+    full_frame = [0x55, 0xAA, 0xDC, len_byte] + data
+    checksum = 0
+    for byte in full_frame[3:]:
+        checksum ^= byte
+    
+    return full_frame + [checksum]
+
+```
+### 4. 架构提示
+
+* **大端序（Big-Endian）约束**：如果您的控制系统运行在 ARM 或 x86 (小端) 环境中，涉及多字节数值（如 16 位角度值 `0x1554`）时，**必须显式进行字节交换**（例如：`15 54`，高位在前）。
+* **校验一致性**：在实现串口读取时，必须先读取 `Byte 3` 确定帧长 `n`，再按 `n+1` 个字节读取剩余数据，最后对比 `Checksum`。若校验失败，必须清空接收缓冲区，防止帧错位。
+void print_log(std::string message) {
+    std::cout << "[SearchlightManager] " << message << std::endl;
+}
+代码需要使用print_log()函数实现日志，以便于调试和监控设备状态。
+代码需要大量的中文日志输出，以便于调试和监控设备状态。
+代码需要规范的中文注释
+启动参数里太带有是否打印串口原始数据的开关
+代码是C++11标准的，使用了智能指针和线程库。
+
+文件树：
+编/解码，
+操作码生成器类，
+初始化参数类，
+状态类，
+串口通信类，
+业务：LED 闪烁、亮度逻辑，
+业务：角度控制逻辑
